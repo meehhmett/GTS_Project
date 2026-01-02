@@ -17,3 +17,7 @@ exports.login = async (req, res) => {
         res.status(401).json({ error: err.message });
     }
 };
+exports.me = async (req, res) => {
+    res.json({ user: req.user });
+};
+

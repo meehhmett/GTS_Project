@@ -13,13 +13,17 @@ exports.search = async (q) => {
         institute_id,
         language_id,
         author_id,
+
+        // text filters
         keyword,
         topic,
-        supervisor,
+        supervisor, // eski
+        name, // YENI: author OR supervisor ortak arama
         q: textQuery,
+
         limit = 20,
         page = 1,
-        offset, // isteyen yine offset gönderebilir
+        offset,
     } = q;
 
     const pageSize = Math.min(Math.max(Number(limit) || 20, 1), 200);
@@ -43,6 +47,7 @@ exports.search = async (q) => {
         where.push(`(t.title ilike ${p} or coalesce(t.abstract,'') ilike ${p})`);
     }
 
+    // keyword text match
     if (keyword) {
         const p = addParam(params, keyword);
         where.push(`
@@ -56,6 +61,7 @@ exports.search = async (q) => {
     `);
     }
 
+    // topic text match
     if (topic) {
         const p = addParam(params, topic);
         where.push(`
@@ -69,6 +75,7 @@ exports.search = async (q) => {
     `);
     }
 
+    // supervisor name contains (legacy)
     if (supervisor) {
         const p = addParam(params, `%${supervisor}%`);
         where.push(`
@@ -82,12 +89,30 @@ exports.search = async (q) => {
     `);
     }
 
+    // ✅ NEW: name = author OR supervisor (tek kutu)
+    if (name) {
+        const p = addParam(params, `%${name}%`);
+        where.push(`
+      (
+        (pa.first_name || ' ' || pa.last_name) ilike ${p}
+        or exists (
+          select 1
+          from thesis_supervisor ts
+          join person sp on sp.person_id = ts.person_id
+          where ts.thesis_no = t.thesis_no
+            and (sp.first_name || ' ' || sp.last_name) ilike ${p}
+        )
+      )
+    `);
+    }
+
     const whereSql = where.length ? `where ${where.join(" and ")}` : "";
 
     // total query (limit/offset olmadan)
     const countSql = `
     select count(*)::int as total
     from thesis t
+    join person pa on pa.person_id = t.author_id
     ${whereSql};
   `;
 
@@ -125,7 +150,7 @@ exports.search = async (q) => {
   `;
 
     const [countRes, dataRes] = await Promise.all([
-        pool.query(countSql, params.slice(0, params.length - 2)), // limit/offset paramlarını sayımdan çıkar
+        pool.query(countSql, params.slice(0, params.length - 2)),
         pool.query(dataSql, params),
     ]);
 
@@ -141,81 +166,10 @@ exports.search = async (q) => {
         items: dataRes.rows,
     };
 };
-exports.getByNo = async (no) => {
-    // tek thesis + keyword/topic/supervisor listeleri
-    const base = await pool.query(
-        `
-    select
-      t.thesis_no,
-      t.title,
-      t.abstract,
-      t.year,
-      t.type,
-      t.submission_date,
-      t.number_of_pages,
-      t.author_id,
-      (pa.first_name || ' ' || pa.last_name) as author_name,
-      t.language_id,
-      l.language_name,
-      t.university_id,
-      u.university_name,
-      t.institute_id,
-      i.institute_name
-    from thesis t
-    join person pa on pa.person_id = t.author_id
-    join language l on l.language_id = t.language_id
-    join university u on u.university_id = t.university_id
-    join institute i on i.institute_id = t.institute_id
-    where t.thesis_no = $1
-    `,
-        [no]
-    );
 
-    if (!base.rows[0]) return null;
-
-    const [keywords, topics, supervisors] = await Promise.all([
-        pool.query(
-            `
-      select k.keyword_id, k.keyword_text
-      from thesis_keyword tk
-      join keyword k on k.keyword_id = tk.keyword_id
-      where tk.thesis_no = $1
-      order by k.keyword_id asc
-      `,
-            [no]
-        ),
-        pool.query(
-            `
-      select st.topic_id, st.topic_name
-      from thesis_subject ts
-      join subject_topic st on st.topic_id = ts.topic_id
-      where ts.thesis_no = $1
-      order by st.topic_id asc
-      `,
-            [no]
-        ),
-        pool.query(
-            `
-      select s.person_id, (p.first_name || ' ' || p.last_name) as name, s.supervisor_role
-      from thesis_supervisor s
-      join person p on p.person_id = s.person_id
-      where s.thesis_no = $1
-      order by s.supervisor_role asc, s.person_id asc
-      `,
-            [no]
-        ),
-    ]);
-
-    return {
-        ...base.rows[0],
-        keywords: keywords.rows,
-        topics: topics.rows,
-        supervisors: supervisors.rows,
-    };
-};
+// CREATE (admin)
 exports.create = async (body) => {
     const client = await pool.connect();
-
     try {
         await client.query("begin");
 
@@ -234,7 +188,6 @@ exports.create = async (body) => {
             supervisors = [],
         } = body;
 
-        // 1) thesis
         await client.query(
             `
       insert into thesis
@@ -255,36 +208,29 @@ exports.create = async (body) => {
             ]
         );
 
-        // 2) keywords
         for (const k of keywords) {
             await client.query(
-                `insert into thesis_keyword (thesis_no, keyword_id)
-         values ($1,$2)`,
+                `insert into thesis_keyword (thesis_no, keyword_id) values ($1,$2)`,
                 [thesis_no, k]
             );
         }
 
-        // 3) topics
         for (const t of topics) {
             await client.query(
-                `insert into thesis_subject (thesis_no, topic_id)
-         values ($1,$2)`,
+                `insert into thesis_subject (thesis_no, topic_id) values ($1,$2)`,
                 [thesis_no, t]
             );
         }
 
-        // 4) supervisors
         for (const s of supervisors) {
             await client.query(
-                `insert into thesis_supervisor
-           (thesis_no, person_id, supervisor_role)
+                `insert into thesis_supervisor (thesis_no, person_id, supervisor_role)
          values ($1,$2,$3)`,
                 [thesis_no, s.person_id, s.role]
             );
         }
 
         await client.query("commit");
-
         return { ok: true, thesis_no };
     } catch (err) {
         await client.query("rollback");
@@ -293,9 +239,10 @@ exports.create = async (body) => {
         client.release();
     }
 };
+
+// UPDATE (admin)
 exports.update = async (no, body) => {
     const client = await pool.connect();
-
     try {
         await client.query("begin");
 
@@ -313,49 +260,33 @@ exports.update = async (no, body) => {
             supervisors = [],
         } = body;
 
-        // thesis var mı kontrol
         const exists = await client.query(
             `select thesis_no from thesis where thesis_no = $1`,
             [no]
         );
-        if (exists.rowCount === 0) {
-            throw new Error("thesis not found");
-        }
+        if (exists.rowCount === 0) throw new Error("thesis not found");
 
-        // 1) thesis update
         await client.query(
             `
-      update thesis
-      set
-        title = $2,
-        abstract = $3,
-        year = $4,
-        type = $5,
-        author_id = $6,
-        language_id = $7,
-        institute_id = $8,
-        university_id = $9
-      where thesis_no = $1
-      `,
-            [
-                no,
-                title,
-                abstract,
-                year,
-                type,
-                author_id,
-                language_id,
-                institute_id,
-                university_id,
-            ]
+                update thesis
+                set
+                    title = $2,
+                    abstract = $3,
+                    year = $4,
+                    type = $5,
+                    author_id = $6,
+                    language_id = $7,
+                    institute_id = $8,
+                    university_id = $9
+                where thesis_no = $1
+            `,
+            [no, title, abstract, year, type, author_id, language_id, institute_id, university_id]
         );
 
-        // 2) ilişkileri temizle
         await client.query(`delete from thesis_keyword where thesis_no = $1`, [no]);
         await client.query(`delete from thesis_subject where thesis_no = $1`, [no]);
         await client.query(`delete from thesis_supervisor where thesis_no = $1`, [no]);
 
-        // 3) yeni ilişkileri ekle
         for (const k of keywords) {
             await client.query(
                 `insert into thesis_keyword (thesis_no, keyword_id) values ($1,$2)`,
@@ -373,13 +304,12 @@ exports.update = async (no, body) => {
         for (const s of supervisors) {
             await client.query(
                 `insert into thesis_supervisor (thesis_no, person_id, supervisor_role)
-         values ($1,$2,$3)`,
+                 values ($1,$2,$3)`,
                 [no, s.person_id, s.role]
             );
         }
 
         await client.query("commit");
-
         return { ok: true, thesis_no: no };
     } catch (err) {
         await client.query("rollback");
@@ -388,44 +318,110 @@ exports.update = async (no, body) => {
         client.release();
     }
 };
+
+// DELETE (cascade yoksa manuel, cascade varsa sadece thesis delete de yeter)
 exports.remove = async (no) => {
     const client = await pool.connect();
-
     try {
         await client.query("begin");
 
-        // önce child tablolar
-        await client.query(
-            `delete from thesis_keyword where thesis_no = $1`,
-            [no]
-        );
+        // cascade yoksa child’ları önce sil
+        await client.query(`delete from thesis_keyword where thesis_no = $1`, [no]);
+        await client.query(`delete from thesis_subject where thesis_no = $1`, [no]);
+        await client.query(`delete from thesis_supervisor where thesis_no = $1`, [no]);
 
-        await client.query(
-            `delete from thesis_subject where thesis_no = $1`,
-            [no]
-        );
+        const res = await client.query(`delete from thesis where thesis_no = $1`, [no]);
 
-        await client.query(
-            `delete from thesis_supervisor where thesis_no = $1`,
-            [no]
-        );
-
-        // sonra parent
-        const res = await client.query(
-            `delete from thesis where thesis_no = $1`,
-            [no]
-        );
-
-        if (res.rowCount === 0) {
-            throw new Error("thesis not found");
-        }
+        if (res.rowCount === 0) throw new Error("thesis not found");
 
         await client.query("commit");
         return { ok: true, thesis_no: no };
-
     } catch (err) {
         await client.query("rollback");
         throw err;
+    } finally {
+        client.release();
+    }
+};
+
+exports.getByNo = async (no) => {
+    const client = await pool.connect();
+    try {
+        // ana tez
+        const base = await client.query(
+            `
+      select
+        t.thesis_no,
+        t.title,
+        t.abstract,
+        t.year,
+        t.type,
+        t.submission_date,
+        t.number_of_pages,
+        t.author_id,
+        (pa.first_name || ' ' || pa.last_name) as author_name,
+        t.language_id,
+        l.language_name,
+        t.university_id,
+        u.university_name,
+        t.institute_id,
+        i.institute_name
+      from thesis t
+      join person pa on pa.person_id = t.author_id
+      join language l on l.language_id = t.language_id
+      join university u on u.university_id = t.university_id
+      join institute i on i.institute_id = t.institute_id
+      where t.thesis_no = $1
+      `,
+            [Number(no)]
+        );
+
+        if (base.rowCount === 0) return null;
+
+        const thesis = base.rows[0];
+
+        // keywords
+        const keywords = await client.query(
+            `
+      select k.keyword_id, k.keyword_text
+      from thesis_keyword tk
+      join keyword k on k.keyword_id = tk.keyword_id
+      where tk.thesis_no = $1
+      `,
+            [Number(no)]
+        );
+
+        // topics
+        const topics = await client.query(
+            `
+      select st.topic_id, st.topic_name
+      from thesis_subject ts
+      join subject_topic st on st.topic_id = ts.topic_id
+      where ts.thesis_no = $1
+      `,
+            [Number(no)]
+        );
+
+        // supervisors
+        const supervisors = await client.query(
+            `
+      select
+        p.person_id,
+        (p.first_name || ' ' || p.last_name) as name,
+        ts.supervisor_role
+      from thesis_supervisor ts
+      join person p on p.person_id = ts.person_id
+      where ts.thesis_no = $1
+      `,
+            [Number(no)]
+        );
+
+        return {
+            ...thesis,
+            keywords: keywords.rows,
+            topics: topics.rows,
+            supervisors: supervisors.rows,
+        };
     } finally {
         client.release();
     }
